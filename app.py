@@ -1,0 +1,141 @@
+import os
+import re
+import json
+import hashlib
+from datetime import datetime, timedelta
+
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters
+
+from groq import Groq
+import dateparser
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+# ================= CONFIG =================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+TIMEZONE = "Asia/Kolkata"
+CALENDAR_ID = "primary"
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+
+FALLBACK_START = 20
+FALLBACK_END = 21
+
+client = Groq(api_key=GROQ_API_KEY)
+
+app = Flask(__name__)
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# ================= CLEAN =================
+def clean_text(text):
+    return re.sub(r'https?://\S+', '', text)
+
+def extract_link(text):
+    url = re.search(r'(https?://\S+)', text)
+    return url.group(0) if url else ""
+
+# ================= AI PARSE =================
+def ai_parse(text):
+    prompt = f"""
+Extract event details from this text:
+
+{text}
+
+Return ONLY JSON:
+{{
+  "title": "...",
+  "start": "ISO datetime",
+  "end": "ISO datetime"
+}}
+"""
+
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    try:
+        data = json.loads(response.choices[0].message.content)
+        return (
+            data["title"],
+            datetime.fromisoformat(data["start"]),
+            datetime.fromisoformat(data["end"])
+        )
+    except:
+        return None
+
+# ================= FALLBACK =================
+def fallback_parse(text):
+    dt = dateparser.parse(text, settings={"PREFER_DATES_FROM": "future"})
+    if dt:
+        return text, dt, dt + timedelta(hours=1)
+    return None
+
+def parse_event(text):
+    cleaned = clean_text(text)
+
+    result = ai_parse(cleaned)
+    if result:
+        return result
+
+    result = fallback_parse(cleaned)
+    if result:
+        return result
+
+    now = datetime.now()
+    return text, now.replace(hour=FALLBACK_START, minute=0), now.replace(hour=FALLBACK_END, minute=0)
+
+# ================= CALENDAR =================
+def create_event(title, link, start, end, uid):
+    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    service = build('calendar', 'v3', credentials=creds)
+
+    existing = service.events().list(calendarId=CALENDAR_ID, q=uid).execute().get('items', [])
+    if existing:
+        return "⚠️ Duplicate skipped"
+
+    event = {
+        'summary': title,
+        'description': link + f"\nID:{uid}",
+        'start': {'dateTime': start.isoformat(), 'timeZone': TIMEZONE},
+        'end': {'dateTime': end.isoformat(), 'timeZone': TIMEZONE},
+    }
+
+    service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+
+    return f"✅ Scheduled\n🕒 {start} → {end}"
+
+# ================= TELEGRAM HANDLER =================
+async def handle(update: Update, context):
+    text = update.message.text
+
+    title, start, end = parse_event(text)
+    link = extract_link(text)
+
+    uid = hashlib.md5(text.encode()).hexdigest()
+
+    result = create_event(title, link, start, end, uid)
+
+    await update.message.reply_text(result)
+
+# Register handler
+telegram_app.add_handler(MessageHandler(filters.TEXT, handle))
+
+# ================= WEBHOOK =================
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+    telegram_app.process_update(update)
+    return "ok"
+
+@app.route("/")
+def home():
+    return "Bot running"
+
+# ================= START =================
+if __name__ == "__main__":
+    app.run(port=5000)
