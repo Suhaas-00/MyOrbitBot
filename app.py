@@ -26,11 +26,18 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 FALLBACK_START = 20
 FALLBACK_END = 21
 
+# Validate env
+if not TELEGRAM_TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN not set")
+if not GROQ_API_KEY:
+    raise ValueError("❌ GROQ_API_KEY not set")
+
 client = Groq(api_key=GROQ_API_KEY)
 
 app = Flask(__name__)
 
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
 
 # ================= CLEAN =================
 def clean_text(text):
@@ -65,7 +72,7 @@ Return ONLY JSON:
 
         content = response.choices[0].message.content.strip()
 
-        # Ensure JSON parsing safe
+        # Clean markdown if present
         content = content.replace("```json", "").replace("```", "").strip()
 
         data = json.loads(content)
@@ -76,7 +83,7 @@ Return ONLY JSON:
             datetime.fromisoformat(data["end"])
         )
     except Exception as e:
-        print("AI parse error:", e)
+        print("⚠️ AI parse failed:", e)
         return None
 
 
@@ -91,14 +98,17 @@ def fallback_parse(text):
 def parse_event(text):
     cleaned = clean_text(text)
 
+    # 1️⃣ Try AI
     result = ai_parse(cleaned)
     if result:
         return result
 
+    # 2️⃣ Try dateparser
     result = fallback_parse(cleaned)
     if result:
         return result
 
+    # 3️⃣ Final fallback
     now = datetime.now()
     return (
         text,
@@ -112,7 +122,7 @@ def create_event(title, link, start, end, uid):
     creds = Credentials.from_authorized_user_file('token.json', SCOPES)
     service = build('calendar', 'v3', credentials=creds)
 
-    # Duplicate check
+    # Duplicate prevention
     existing = service.events().list(
         calendarId=CALENDAR_ID,
         q=uid
@@ -154,27 +164,33 @@ async def handle(update: Update, context):
         await update.message.reply_text(result)
 
     except Exception as e:
-        print("Handler error:", e)
-        await update.message.reply_text("❌ Error processing event")
+        print("❌ Handler error:", e)
+        await update.message.reply_text("❌ Error processing request")
 
 
-# Register handler
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+telegram_app.add_handler(
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle)
+)
 
 
 # ================= WEBHOOK =================
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    asyncio.run(telegram_app.process_update(update))
-    return "ok"
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        asyncio.run(telegram_app.process_update(update))
+        return "ok"
+    except Exception as e:
+        print("❌ Webhook error:", e)
+        return "error", 500
 
 
 @app.route("/")
 def home():
-    return "Bot running 🚀"
+    return "Bot is running 🚀"
 
 
 # ================= START =================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
